@@ -1,0 +1,62 @@
+---
+- name: Install and configure nginx on Ubuntu 24.04
+  hosts: web
+  become: true
+  gather_facts: false
+
+  vars:
+    nginx_site_title: "Hello from OpenTofu + Ansible on Proxmox"
+
+  pre_tasks:
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 300
+
+    - name: Wait for cloud-init to finish (apt lock)
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init
+      changed_when: false
+      # rc 2 = "done with recoverable errors", e.g. deprecation warnings in the
+      # user-data that Proxmox generates. cloud-init still finished, so accept it.
+      failed_when: cloud_init.rc not in [0, 2]
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Deploy index page
+      ansible.builtin.template:
+        src: templates/index.html.j2
+        dest: /var/www/html/index.html
+        owner: www-data
+        group: www-data
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Ensure nginx is enabled and running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+  post_tasks:
+    - name: Verify nginx responds with HTTP 200
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}/"
+        status_code: 200
+      delegate_to: localhost
+      become: false

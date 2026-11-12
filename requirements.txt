@@ -1,0 +1,3 @@
+# Python dependencies (installed into .venv by `make venv`)
+# The playbook only uses ansible.builtin modules, so ansible-core is enough
+ansible-core>=2.17,<3

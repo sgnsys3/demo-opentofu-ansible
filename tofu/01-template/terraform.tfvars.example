@@ -1,0 +1,11 @@
+proxmox_endpoint  = "https://192.168.1.10:8006/"
+proxmox_api_token = "tofu@pve!tofu=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+proxmox_insecure  = true
+
+node_name          = "pve"
+image_datastore_id = "local"
+vm_datastore_id    = "local-lvm"
+bridge             = "vmbr0"
+
+template_vm_id = 9000
+template_name  = "ubuntu-2404-template"
