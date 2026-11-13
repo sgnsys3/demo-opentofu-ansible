@@ -11,5 +11,13 @@ ansible/inventory.ini
 
 # Local tooling (make setup)
 .ssh/
+# Generated passwords (e.g. Grafana admin), created by Ansible
+.secrets/
 .venv/
 bin/
+
+# Claude Code local working files
+.claude/
+
+# Python bytecode
+__pycache__/

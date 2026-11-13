@@ -1,21 +1,35 @@
 # Demo: OpenTofu + Proxmox + Ansible
 
-This demo goes from an empty Proxmox VE host to a running web server, using Infrastructure as Code:
+This demo goes from an empty Proxmox VE host to a running, monitored web server, using Infrastructure as Code:
 
 1. **OpenTofu** with the [`bpg/proxmox`](https://registry.terraform.io/providers/bpg/proxmox/latest/docs) provider.
 2. **Build an Ubuntu 24.04 LTS template** from the official cloud image, using OpenTofu.
 3. **Deploy a new VM** as a **linked clone** of the template from step 2. cloud-init sets the static IP, the user and the SSH key.
 4. **Install nginx with Ansible** on the new VM. OpenTofu writes the Ansible inventory for you.
+5. **Monitor nginx the SRE way** with Prometheus and Grafana on a second VM: the four **golden signals**, an **SLO** with an **error budget**, and **alerts**.
 
 ```
-┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────┐    ┌─────────────┐
-│ Ubuntu cloud img │ ─▶ │ 01-template (tofu)   │ ─▶ │ 02-instance      │ ─▶ │ Ansible     │
-│ noble .qcow2     │    │ VM 9000 → template   │    │ linked → web-01  │    │ nginx.yml   │
-└──────────────────┘    └──────────────────────┘    │ + inventory.ini  │    └─────────────┘
+┌──────────────────┐    ┌──────────────────────┐    ┌──────────────────┐    ┌────────────────┐
+│ Ubuntu cloud img │ ─▶ │ 01-template (tofu)   │ ─▶ │ 02-instance      │ ─▶ │ Ansible        │
+│ noble .qcow2     │    │ VM 9000 → template   │    │ linked → web-01  │    │ nginx.yml      │
+└──────────────────┘    └──────────────────────┘    │          mon-01  │    │ monitoring.yml │
+                                                    │ + inventory.ini  │    └────────────────┘
                                                     └──────────────────┘
 ```
 
-**Versions used** (all 4 steps tested end to end on this setup):
+What runs where after `make all`:
+
+```
+          your laptop                       web-01 (group: web)                  mon-01 (group: monitoring)
+  ┌────────────────────────┐   HTTP   ┌──────────────────────────────┐ scrape ┌────────────────────────────┐
+  │ browser / make load    │ ───────▶ │ nginx :80                    │ ◀───── │ Prometheus :9090           │
+  │                        │          │  ├ nginxlog-exporter :4040   │        │  ├ rules: SLIs + alerts    │
+  │ browser ───────────────┼──────────┼──┤ nginx-exporter    :9113   │        │  └ node-exporter :9100     │
+  │   Grafana / Prometheus │          │  └ node-exporter     :9100   │        │ Grafana :3000 (dashboard)  │
+  └────────────────────────┘          └──────────────────────────────┘        └────────────────────────────┘
+```
+
+**Versions used** (all 5 steps tested end to end on this setup):
 
 | Component | Version |
 |---|---|
@@ -23,16 +37,24 @@ This demo goes from an empty Proxmox VE host to a running web server, using Infr
 | OpenTofu | 1.13.9 |
 | bpg/proxmox | 0.122.0 |
 | ansible-core | 2.21.6 |
+| Prometheus (Ubuntu package) | 2.45.3 |
+| Grafana | 13.3.1 |
+| node-exporter / nginx-exporter | 1.7.0 / 1.1.0 |
+| prometheus-nginxlog-exporter | 1.11.0 |
 
 ## Project layout
 
 ```
 .
-├── Makefile                      # make setup / template / instance / nginx
+├── Makefile                      # make setup / template / instance / nginx / monitoring / load
 ├── requirements.txt              # Python deps (ansible-core) for .venv
 ├── bin/tofu                      # (gitignored) created by `make tofu-install`
 ├── .venv/                        # (gitignored) created by `make venv`
 ├── .ssh/id_ed25519               # (gitignored) demo SSH key created by `make ssh-key`
+├── .secrets/                     # (gitignored) generated Grafana admin password
+├── scripts/
+│   ├── loadgen.py                # test traffic for the dashboard (make load)
+│   └── gen_dashboard.py          # generates the Grafana dashboard JSON
 ├── tofu/
 │   ├── 01-template/              # Steps 1-2: provider + Ubuntu 24.04 template
 │   │   ├── versions.tf           #   bpg/proxmox provider
@@ -47,10 +69,16 @@ This demo goes from an empty Proxmox VE host to a running web server, using Infr
 │       ├── outputs.tf
 │       ├── templates/inventory.tftpl
 │       └── terraform.tfvars.example
-└── ansible/                      # Step 4: install nginx
+└── ansible/
     ├── ansible.cfg
-    ├── nginx.yml
-    └── templates/index.html.j2
+    ├── nginx.yml                 # Step 4: nginx + demo endpoints (/health, /error, /slow)
+    ├── monitoring.yml            # Step 5: exporters, Prometheus, Grafana
+    ├── templates/                #   index.html, nginx site, prometheus.yml (from the inventory)
+    └── files/
+        ├── nginx-monitoring.conf #   timed access log + stub_status
+        ├── nginxlog-exporter.yml
+        ├── prometheus/golden-signals.rules.yml   # SLIs (recording rules) + alerts
+        └── grafana/              #   data source, dashboard provider, golden-signals.json
 ```
 
 **Why two separate OpenTofu states?** In real life you build a template once and many VMs are cloned from it. Keeping them apart means destroying the VMs never deletes the template.
@@ -229,7 +257,7 @@ cp tofu/02-instance/terraform.tfvars.example tofu/02-instance/terraform.tfvars
 make all
 ```
 
-`make all` is the same as `make template`, then `make instance`, then `make nginx`. Run `make help` to see every target. The commands behind each target are shown in the sections below.
+`make all` is the same as `make template`, then `make instance`, then `make nginx`, then `make monitoring`. Run `make help` to see every target. The commands behind each target are shown in the sections below.
 
 When it finishes, open `http://<VM_IP>/` to see the page that Ansible deployed.
 
@@ -316,29 +344,45 @@ cd tofu/02-instance
 
 What happens ([main.tf](tofu/02-instance/main.tf)):
 
-- A **linked clone** of the template is made for each entry in `var.instances` (by default just `web-01`). It takes only a few seconds.
+- A **linked clone** of the template is made for each entry in `var.instances`: `web-01` (group `web`) and `mon-01` (group `monitoring`). It takes only a few seconds.
   - A linked clone doesn't copy the disk. Its disk is a thin snapshot of the template's disk and only stores the blocks that change.
   - For a full, independent copy, set `full_clone = true`.
   - While linked clones exist, the template can't be deleted. `make destroy` removes the VMs first for this reason.
-- CPU and RAM are set. The disk keeps the template's 5 GB. Raise `disk_size` if you need more room.
+- CPU and RAM are set. The disk keeps the template's 5 GB unless the instance sets `disk_size`. `mon-01` uses 10 GB, because Grafana alone takes about 2 GB.
 - cloud-init configures:
   - a static IP, gateway and DNS
   - user `ubuntu` with your SSH public key
-- `ansible/inventory.ini` is written automatically from [inventory.tftpl](tofu/02-instance/templates/inventory.tftpl).
+- `ansible/inventory.ini` is written automatically from [inventory.tftpl](tofu/02-instance/templates/inventory.tftpl), with one Ansible group per `group` value:
+
+  ```ini
+  [monitoring]
+  mon-01 ansible_host=192.168.1.102
+
+  [web]
+  web-01 ansible_host=192.168.1.101
+
+  [all:vars]
+  ansible_user=ubuntu
+  ansible_ssh_private_key_file=/path/to/project/.ssh/id_ed25519
+  ```
 
 Example output:
 
 ```
-proxmox_virtual_environment_vm.web["web-01"]: Creation complete after 4s [id=201]
+proxmox_virtual_environment_vm.vm["mon-01"]: Creation complete after 5s [id=202]
+proxmox_virtual_environment_vm.vm["web-01"]: Creation complete after 5s [id=201]
 local_file.ansible_inventory: Creation complete after 0s [id=...]
-Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
 
 instances = {
+  "mon-01" = "192.168.1.102"
   "web-01" = "192.168.1.101"
 }
-ssh_commands = [
-  "ssh -i /path/to/project/.ssh/id_ed25519 ubuntu@192.168.1.101",
-]
+urls = {
+  "mon-01 grafana"    = "http://192.168.1.102:3000/"
+  "mon-01 prometheus" = "http://192.168.1.102:9090/"
+  "web-01"            = "http://192.168.1.101/"
+}
 ```
 
 To check that it really is a linked clone, read the clone task log in the Proxmox UI (VM 9000 → Task History). It says `create linked clone of drive scsi0`.
@@ -349,12 +393,13 @@ To log in to the VM, use the project key:
 ssh -i .ssh/id_ed25519 ubuntu@192.168.1.101
 ```
 
-For more VMs, add entries to `instances` and run `tofu apply` again:
+For more VMs, add entries to `instances` and run `tofu apply` again. `group`, `cores`, `memory` and `disk_size` are optional (default group: `web`). A new `web-*` VM is picked up by monitoring automatically the next time you run `make monitoring`:
 
 ```hcl
 instances = {
-  "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24" }
-  "web-02" = { vm_id = 202, ip_cidr = "192.168.1.102/24" }
+  "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24", group = "web" }
+  "mon-01" = { vm_id = 202, ip_cidr = "192.168.1.102/24", group = "monitoring", disk_size = 10 }
+  "web-02" = { vm_id = 203, ip_cidr = "192.168.1.103/24", group = "web" }
 }
 ```
 
@@ -381,14 +426,23 @@ The playbook ([nginx.yml](ansible/nginx.yml)) runs these steps in order:
 2. Wait for `cloud-init` to finish, so it doesn't fight over the apt lock on first boot. Exit code 2 ("degraded done") also counts as success: it only means there were deprecation warnings in the user-data that Proxmox generates.
 3. Install `nginx`.
 4. Deploy an `index.html` page from a template. The page shows the hostname, IP and OS.
-5. Make sure nginx is running and starts on boot.
-6. Send an HTTP request from your machine to confirm it returns `200 OK`.
+5. Deploy the site config with three **demo endpoints** used in step 5:
+
+   | Path | Returns | Used to show |
+   |---|---|---|
+   | `/health` | `200 ok` (not logged) | health checks |
+   | `/error` | `500` every time | the **Errors** signal and the error budget |
+   | `/slow` | a 6 KB file sent at 4 KB/s (~1-1.5 s) | the **Latency** signal |
+
+6. Check the config with `nginx -t`, then reload nginx (only if something changed).
+7. Make sure nginx is running and starts on boot.
+8. Send HTTP requests from your machine to confirm `/` and `/health` return 200 and `/error` returns 500.
 
 Expected result (a second run shows `changed=0`, because the playbook is idempotent):
 
 ```
 PLAY RECAP *********************************************************************
-web-01  : ok=8    changed=3    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+web-01  : ok=11   changed=5    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
 ```
 
 To check it yourself:
@@ -396,6 +450,121 @@ To check it yourself:
 ```bash
 curl http://192.168.1.101/
 ```
+
+### Step 5: Monitor nginx with the golden signals
+
+```bash
+make monitoring
+```
+
+`make monitoring` runs:
+
+```bash
+cd ansible
+../.venv/bin/ansible-playbook monitoring.yml
+```
+
+#### SRE in 1 minute
+
+**Site Reliability Engineering (SRE)** treats reliability as something you measure and set a target for. A few words you'll see on the dashboard:
+
+| Term | Meaning | In this demo |
+|---|---|---|
+| **Golden signals** | The 4 numbers that tell you if a user-facing service is healthy (from Google's SRE book) | Latency, Traffic, Errors, Saturation |
+| **SLI** (indicator) | A measurement of how good the service is, usually a ratio of good events / all events | % of requests that are not 5xx; % of requests faster than 500 ms |
+| **SLO** (objective) | The target for an SLI | 99% of requests succeed, p95 latency < 500 ms |
+| **Error budget** | How much failure the SLO allows: 100% - SLO | 1% of requests may fail. When it's used up, stop shipping risky changes and fix reliability |
+| **Burn rate** | How fast the error budget is being used. 1 = exactly on budget | Burn rate 14.4 would empty a 30-day budget in about 2 days, so it pages someone |
+| **p95 / p99** | Percentile: 95% (or 99%) of requests were faster than this | Averages hide slow requests; percentiles show what the unluckiest users feel |
+
+#### The four golden signals, and where each number comes from
+
+| Signal | Question | Metric | Exporter (on web-01) |
+|---|---|---|---|
+| **Latency** | How long do requests take? | `nginx_http_response_time_seconds_hist_bucket` (histogram → p50/p95/p99) | [nginxlog-exporter](https://github.com/martin-helmich/prometheus-nginxlog-exporter) reads `$request_time` from a second access log |
+| **Traffic** | How much demand is there? | `nginx_http_response_count_total` (requests/s), `nginx_connections_active` | nginxlog-exporter, nginx-exporter (`stub_status`) |
+| **Errors** | How many requests fail? | `nginx_http_response_count_total{status=~"5.."}` / all requests | nginxlog-exporter |
+| **Saturation** | How "full" is the server? | `node_cpu_seconds_total`, `node_memory_MemAvailable_bytes`, `node_filesystem_avail_bytes` | node-exporter (on every VM) |
+
+nginx's built-in `stub_status` only counts connections and requests. It knows nothing about latency or status codes. That's why the playbook adds a **second access log with `$request_time`** ([nginx-monitoring.conf](ansible/files/nginx-monitoring.conf)) and runs nginxlog-exporter to turn it into metrics.
+
+#### What the playbook does
+
+1. **All VMs:** grow the root partition if `disk_size` was raised, then install **node-exporter** (`:9100`).
+2. **web-01:**
+   - Add the timed access log and a `stub_status` endpoint that only listens on `127.0.0.1:8080`.
+   - Install **nginx-exporter** (`:9113`).
+   - Install **nginxlog-exporter** (`:4040`). The `.deb` is checked against the release's SHA256 checksum. It runs as an unprivileged systemd `DynamicUser` in the `adm` group, so it can read the nginx logs.
+3. **mon-01:**
+   - Install **Prometheus**. Its [prometheus.yml](ansible/templates/prometheus.yml.j2) is generated from the inventory, so new web VMs are scraped automatically. It keeps 7 days of data and loads the [golden-signals rules](ansible/files/prometheus/golden-signals.rules.yml). Both files are checked with `promtool` before they're installed.
+   - Install **Grafana** from the official apt repo, with the Prometheus data source and the **Nginx Golden Signals** dashboard provisioned as code.
+4. **Check:** wait until every Prometheus scrape target is `up`.
+
+Open the URLs from `tofu output urls`:
+
+| URL | What you see |
+|---|---|
+| `http://<mon-01>:3000/` | Grafana, opens straight on the **Nginx Golden Signals** dashboard (anonymous, read-only) |
+| `http://<mon-01>:9090/targets` | Prometheus: every scrape target should be `UP` |
+| `http://<mon-01>:9090/alerts` | Prometheus: the golden-signal alerts and their state |
+
+Log in to Grafana as `admin` (to edit things) with the password in `.secrets/grafana-admin-password`. Ansible generates it on your machine the first time; it's gitignored.
+
+#### The dashboard
+
+| Row | Panels |
+|---|---|
+| **SLO overview** | Availability (SLI, 1h) · Error budget left · p95 latency · Traffic (req/s) · Firing alerts |
+| **Latency** | p50 / p95 / p99 with the 500 ms SLO line · share of requests faster than 500 ms |
+| **Traffic** | requests/s by status code · active connections |
+| **Errors** | 5xx ratio with the 1% budget line · 4xx and 5xx per second |
+| **Saturation** | CPU busy · memory used · root disk used (per VM, with alert lines) |
+
+The dashboard JSON is generated by [scripts/gen_dashboard.py](scripts/gen_dashboard.py). To change the dashboard, edit the script, regenerate the JSON, and run `make monitoring` again:
+
+```bash
+python3 scripts/gen_dashboard.py ansible/files/grafana/golden-signals.json
+```
+
+#### Alerts
+
+| Alert | Fires when | Signal |
+|---|---|---|
+| `NginxDown` | an nginx exporter can't be scraped, or nginx stops answering, for 1 min | Errors |
+| `HighErrorRate` | more than 5% of requests are 5xx for 2 min | Errors |
+| `ErrorBudgetBurnFast` | the error ratio is above 14.4% in **both** the 5 min and 1 h windows (multi-window burn rate) | Errors / SLO |
+| `HighLatencyP95` | p95 latency is above 500 ms for 2 min | Latency |
+| `HighCpu` / `LowMemory` / `DiskAlmostFull` | CPU > 80%, memory > 90%, root disk > 85% for 5 min | Saturation |
+
+The alerts show up in Prometheus and in the "Firing alerts" panel. To get notified by email, Slack and so on, add Alertmanager. It isn't part of this demo, to keep it small.
+
+#### Try it: break things on purpose
+
+Send traffic from your laptop and watch the dashboard. Leave each mode running for a few minutes, because the windows are 1-5 minutes.
+
+```bash
+make load                  # healthy traffic: ~95% 200, a few 404s
+make load MODE=errors      # ~20% of requests get a 500 -> error ratio up, error budget burns, alerts fire
+make load MODE=slow        # ~30% of requests take ~1 s -> p95 latency crosses the 500 ms SLO
+make load MODE=normal RPS=50 DURATION=120
+```
+
+`make load` runs [scripts/loadgen.py](scripts/loadgen.py), which uses only the Python standard library and sends traffic to every host in the `[web]` group:
+
+```bash
+python3 scripts/loadgen.py --mode errors --rps 20 --duration 300
+```
+
+What happened when we tested it on the lab (20 requests/s):
+
+| Test | Load generator result | What Prometheus / Grafana showed |
+|---|---|---|
+| `make load MODE=errors DURATION=240` | `200=3624  404=248  500=928` (19% errors) | 5xx ratio ~19%, error budget left 0%. `ErrorBudgetBurnFast` fired after ~1 min, `HighErrorRate` after ~2 min |
+| `make load MODE=slow DURATION=210` | `200=4200` | p95 latency ~2 s, `HighLatencyP95` fired |
+
+> **Why does p95 show ~2 s when `/slow` takes ~1.1 s?** Prometheus estimates percentiles from histogram **buckets**. Our buckets are `…, 0.5, 1, 2.5, …` seconds, so a request of 1.1 s falls in the 1-2.5 s bucket, and `histogram_quantile()` assumes it could be anywhere inside it. A percentile is only as precise as the buckets around it, so pick buckets close to your SLO threshold (we have one at exactly 0.5 s).
+
+When the load stops, the alerts resolve by themselves within a few minutes. The 1-hour availability and error budget panels take up to an hour to recover, because they look at the whole hour.
 
 ---
 
@@ -441,6 +610,11 @@ rm -rf ./bin ./.venv
 | Black screen in noVNC after boot | This is expected: the template uses a serial console. Use the **xterm.js** console instead. |
 | Ansible `UNREACHABLE` | Check the IP and gateway in tfvars, and make sure your machine can route to the VM subnet. |
 | `Could not get lock /var/lib/dpkg/lock` | cloud-init is still running. The playbook already waits for it; if you still see this, just run it again. |
+| `prometheus-nginxlog-exporter` fails with `permission denied` on `/var/log/nginx/...` | The packaged unit drops all capabilities, so even root can't read the `www-data:adm` 640 logs. The playbook adds a systemd drop-in that runs it as a `DynamicUser` in group `adm`, with our config file. |
+| Grafana "Wait for Grafana to answer" retries a few times | Normal on the first run: Grafana creates its database before it answers (about 30 s). |
+| Dashboard panels say "No data" | No traffic yet. Run `make load`. Latency and error panels need a few minutes of traffic to fill their windows. |
+| A Prometheus target is `DOWN` | Check the exporter on that VM: `systemctl status prometheus-node-exporter prometheus-nginx-exporter prometheus-nginxlog-exporter`. |
+| Disk on mon-01 fills up | Grafana takes about 2 GB. Raise `disk_size` for `mon-01` and run `make instance` and then `make monitoring`. The playbook grows the partition for you. |
 | I want DHCP instead of a static IP | Install `qemu-guest-agent` and set `agent.enabled = true` so the provider can read the IP. This demo uses static IPs to keep things simple. |
 
 ## Production notes
@@ -450,3 +624,4 @@ rm -rf ./bin ./.venv
 - Never commit `terraform.tfvars`. It is already in `.gitignore`.
 - Harden the VMs further, for example by enabling UFW and disabling SSH password login.
 - Consider full clones (`full_clone = true`) for long-lived VMs, so they don't depend on the template.
+- Monitoring: add Alertmanager for notifications, put Grafana behind HTTPS and SSO instead of anonymous access, and pick SLO windows that match your users (usually 28-30 days, not 1 hour).

@@ -1,0 +1,99 @@
+# Managed by Ansible (monitoring.yml)
+#
+# SLO used in this demo:
+#   Availability: 99% of requests succeed (not 5xx)  -> error budget = 1%
+#   Latency:      p95 request time under 500 ms
+groups:
+  # ---------- Recording rules: pre-computed SLIs (the numbers the dashboard and alerts use) ----------
+  - name: golden-signals.recording
+    rules:
+      # Traffic: requests per second
+      - record: instance:nginx_requests:rate1m
+        expr: sum by (instance) (rate(nginx_http_response_count_total[1m]))
+
+      # Errors: share of requests that returned 5xx
+      - record: instance:nginx_errors:ratio_rate5m
+        expr: |
+          sum by (instance) (rate(nginx_http_response_count_total{status=~"5.."}[5m]))
+          /
+          sum by (instance) (rate(nginx_http_response_count_total[5m]))
+      - record: instance:nginx_errors:ratio_rate1h
+        expr: |
+          sum by (instance) (rate(nginx_http_response_count_total{status=~"5.."}[1h]))
+          /
+          sum by (instance) (rate(nginx_http_response_count_total[1h]))
+
+      # Latency: 95th percentile request time
+      - record: instance:nginx_latency_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (instance, le) (rate(nginx_http_response_time_seconds_hist_bucket[5m])))
+
+      # Saturation: CPU busy share, memory used share, root disk used share
+      - record: instance:node_cpu_busy:ratio_rate5m
+        expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+      - record: instance:node_memory_used:ratio
+        expr: 1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+      - record: instance:node_disk_root_used:ratio
+        expr: 1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}
+
+  # ---------- Alerting rules ----------
+  - name: golden-signals.alerts
+    rules:
+      - alert: NginxDown
+        # exporter unreachable, or exporter up but nginx itself not answering
+        expr: up{job=~"nginx|nginxlog"} == 0 or nginx_up == 0
+        for: 1m
+        labels: { severity: critical, signal: errors }
+        annotations:
+          summary: "nginx is down or unmonitored on {{ $labels.instance }}"
+          description: "{{ $labels.job }} on {{ $labels.instance }} has been failing for 1 minute."
+
+      - alert: HighErrorRate
+        expr: instance:nginx_errors:ratio_rate5m > 0.05
+        for: 2m
+        labels: { severity: warning, signal: errors }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} of requests fail"
+          description: "More than 5% of requests returned 5xx over the last 5 minutes."
+
+      # Multi-window burn rate (Google SRE workbook). Burn rate 14.4 = the whole
+      # 30-day error budget would be gone in ~2 days. Both windows must agree,
+      # so a short spike doesn't page anyone, but a real problem pages fast.
+      - alert: ErrorBudgetBurnFast
+        expr: |
+          instance:nginx_errors:ratio_rate5m > (14.4 * 0.01)
+          and
+          instance:nginx_errors:ratio_rate1h > (14.4 * 0.01)
+        for: 1m
+        labels: { severity: critical, signal: errors }
+        annotations:
+          summary: "{{ $labels.instance }} is burning the error budget 14x too fast"
+          description: "Error ratio is above 14.4% in both the 5 minute and the 1 hour window (SLO 99%)."
+
+      - alert: HighLatencyP95
+        expr: instance:nginx_latency_seconds:p95_5m > 0.5
+        for: 2m
+        labels: { severity: warning, signal: latency }
+        annotations:
+          summary: "{{ $labels.instance }}: p95 latency is {{ $value | humanizeDuration }}"
+          description: "95% of requests should finish in under 500 ms."
+
+      - alert: HighCpu
+        expr: instance:node_cpu_busy:ratio_rate5m > 0.8
+        for: 5m
+        labels: { severity: warning, signal: saturation }
+        annotations:
+          summary: "{{ $labels.instance }}: CPU {{ $value | humanizePercentage }} busy"
+
+      - alert: LowMemory
+        expr: instance:node_memory_used:ratio > 0.9
+        for: 5m
+        labels: { severity: warning, signal: saturation }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} of memory used"
+
+      - alert: DiskAlmostFull
+        expr: instance:node_disk_root_used:ratio > 0.85
+        for: 5m
+        labels: { severity: warning, signal: saturation }
+        annotations:
+          summary: "{{ $labels.instance }}: root disk {{ $value | humanizePercentage }} full"

@@ -1,0 +1,9 @@
+# Managed by Ansible (monitoring.yml)
+apiVersion: 1
+providers:
+  - name: demo
+    folder: SRE demo
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

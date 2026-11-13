@@ -1,0 +1,36 @@
+# Managed by Ansible (nginx.yml) - local changes will be overwritten
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    root /var/www/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # ----- Demo endpoints for the golden-signals dashboard -----
+
+    # Health check for monitoring tools. Not logged, so it doesn't skew the metrics.
+    location = /health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Always fails: use it to show the "Errors" signal and burn the error budget.
+    location = /error {
+        default_type text/plain;
+        return 500 "simulated error\n";
+    }
+
+    # Slow on purpose: a 6 KB file sent at 4 KB/s takes about 1.5 s.
+    # Use it to show the "Latency" signal.
+    location = /slow {
+        limit_rate 4k;
+        default_type application/octet-stream;
+        try_files /slow.bin =404;
+    }
+}

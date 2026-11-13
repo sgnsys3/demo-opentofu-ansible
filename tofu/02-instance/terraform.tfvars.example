@@ -9,8 +9,10 @@ vm_datastore_id    = "local-lvm"
 bridge             = "vmbr0"
 
 instances = {
-  "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24" }
-  # "web-02" = { vm_id = 202, ip_cidr = "192.168.1.102/24" }
+  "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24", group = "web" }
+  # Prometheus + Grafana. A bit more disk for the packages and metrics.
+  "mon-01" = { vm_id = 202, ip_cidr = "192.168.1.102/24", group = "monitoring", disk_size = 10 }
+  # "web-02" = { vm_id = 203, ip_cidr = "...", group = "web" }
 }
 
 gateway     = "192.168.1.1"

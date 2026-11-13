@@ -47,13 +47,18 @@ variable "template_node_name" {
 
 # ---------- Instances ----------
 variable "instances" {
-  description = "VMs to create: key = hostname"
+  description = "VMs to create: key = hostname. group = Ansible inventory group. cores/memory/disk_size override the defaults below."
   type = map(object({
-    vm_id   = number
-    ip_cidr = string # e.g. 192.168.1.101/24
+    vm_id     = number
+    ip_cidr   = string # e.g. 192.168.1.101/24
+    group     = optional(string, "web")
+    cores     = optional(number)
+    memory    = optional(number)
+    disk_size = optional(number)
   }))
   default = {
-    "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24" }
+    "web-01" = { vm_id = 201, ip_cidr = "192.168.1.101/24", group = "web" }
+    "mon-01" = { vm_id = 202, ip_cidr = "192.168.1.102/24", group = "monitoring", disk_size = 10 }
   }
 }
 

@@ -1,10 +1,21 @@
 # Clone VMs from the Ubuntu 24.04 template and configure them with cloud-init
-resource "proxmox_virtual_environment_vm" "web" {
+locals {
+  # hostname => IP without the /prefix
+  ips = { for name, vm in var.instances : name => split("/", vm.ip_cidr)[0] }
+
+  # Ansible group => { hostname => IP }
+  groups = {
+    for g in distinct([for vm in var.instances : vm.group]) :
+    g => { for name, vm in var.instances : name => local.ips[name] if vm.group == g }
+  }
+}
+
+resource "proxmox_virtual_environment_vm" "vm" {
   for_each = var.instances
 
   name        = each.key
-  description = "Ubuntu 24.04 web server - managed by OpenTofu"
-  tags        = ["opentofu", "ubuntu-2404", "web"]
+  description = "Ubuntu 24.04 (${each.value.group}) - managed by OpenTofu"
+  tags        = ["opentofu", "ubuntu-2404", each.value.group]
 
   node_name = var.node_name
   vm_id     = each.value.vm_id
@@ -25,22 +36,22 @@ resource "proxmox_virtual_environment_vm" "web" {
   }
 
   cpu {
-    cores = var.cores
+    cores = coalesce(each.value.cores, var.cores)
     type  = "x86-64-v2-AES"
   }
 
   memory {
-    dedicated = var.memory
+    dedicated = coalesce(each.value.memory, var.memory)
   }
 
-  # Keep the template's disk size (no extra space). Raise var.disk_size to grow it.
+  # Keep the template's disk size (no extra space) unless the instance asks for more.
   disk {
     datastore_id = var.vm_datastore_id
     interface    = "scsi0"
     iothread     = true
     discard      = "on"
     ssd          = true
-    size         = var.disk_size
+    size         = coalesce(each.value.disk_size, var.disk_size)
   }
 
   network_device {
@@ -78,12 +89,10 @@ resource "local_file" "ansible_inventory" {
   file_permission = "0644"
 
   content = templatefile("${path.module}/templates/inventory.tftpl", {
-    hosts = {
-      for name, vm in var.instances : name => split("/", vm.ip_cidr)[0]
-    }
+    groups          = local.groups
     user            = var.vm_user
     ssh_private_key = abspath(pathexpand(var.ssh_private_key_path))
   })
 
-  depends_on = [proxmox_virtual_environment_vm.web]
+  depends_on = [proxmox_virtual_environment_vm.vm]
 }

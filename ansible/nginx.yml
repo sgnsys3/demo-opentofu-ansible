@@ -41,6 +41,21 @@
         mode: "0644"
       notify: Reload nginx
 
+    - name: Deploy site config (with demo endpoints /health, /error, /slow)
+      ansible.builtin.template:
+        src: templates/nginx-site.conf.j2
+        dest: /etc/nginx/sites-available/default
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Create the file served slowly by /slow
+      ansible.builtin.copy:
+        dest: /var/www/html/slow.bin
+        content: "{{ 'x' * 6144 }}"
+        owner: www-data
+        group: www-data
+        mode: "0644"
+
     - name: Ensure nginx is enabled and running
       ansible.builtin.service:
         name: nginx
@@ -48,15 +63,27 @@
         enabled: true
 
   handlers:
-    - name: Reload nginx
+    # Both handlers listen to "Reload nginx" and run in this order:
+    # check the config first, so a typo never takes the site down.
+    - name: Check nginx config
+      ansible.builtin.command: nginx -t
+      changed_when: false
+      listen: Reload nginx
+
+    - name: Reload nginx service
       ansible.builtin.service:
         name: nginx
         state: reloaded
+      listen: Reload nginx
 
   post_tasks:
-    - name: Verify nginx responds with HTTP 200
+    - name: Verify the demo endpoints
       ansible.builtin.uri:
-        url: "http://{{ ansible_host }}/"
-        status_code: 200
+        url: "http://{{ ansible_host }}{{ item.path }}"
+        status_code: "{{ item.status }}"
+      loop:
+        - { path: /, status: 200 }
+        - { path: /health, status: 200 }
+        - { path: /error, status: 500 }
       delegate_to: localhost
       become: false

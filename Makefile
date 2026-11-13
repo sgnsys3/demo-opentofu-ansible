@@ -17,7 +17,7 @@ TOFU_URL := https://github.com/opentofu/opentofu/releases/download/v$(TOFU_VERSI
 DL_DIR   := bin/.download
 
 .PHONY: help setup venv tofu-install ssh-key versions clean-tools \
-        template instance ping nginx all \
+        template instance ping nginx monitoring load all \
         destroy destroy-instance destroy-template
 
 help:
@@ -34,7 +34,9 @@ help:
 	@echo "  make instance          # 3)   clone VM(s) from the template + write inventory"
 	@echo "  make ping              #      check Ansible can reach the VM(s)"
 	@echo "  make nginx             # 4)   install nginx with Ansible"
-	@echo "  make all               # run steps 1-4 in order"
+	@echo "  make monitoring        # 5)   Prometheus + Grafana golden-signals dashboard"
+	@echo "  make load [MODE=...]   #      send test traffic (MODE=normal|errors|slow)"
+	@echo "  make all               # run steps 1-5 in order"
 	@echo "  make destroy           # destroy VM(s) and the template"
 
 # ---------- Setup ----------
@@ -89,7 +91,17 @@ ping: venv
 nginx: venv
 	cd ansible && $(PLAYBOOK) nginx.yml
 
-all: template instance nginx
+monitoring: venv
+	cd ansible && $(PLAYBOOK) monitoring.yml
+
+# Test traffic for the dashboard, e.g. make load MODE=errors DURATION=120 RPS=30
+MODE     ?= normal
+RPS      ?= 20
+DURATION ?= 300
+load:
+	$(PYTHON) scripts/loadgen.py --mode $(MODE) --rps $(RPS) --duration $(DURATION)
+
+all: template instance nginx monitoring
 
 destroy-instance: bin/tofu .ssh/id_ed25519
 	cd tofu/02-instance && $(TOFU) destroy -auto-approve

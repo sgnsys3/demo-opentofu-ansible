@@ -1,0 +1,13 @@
+# Managed by Ansible (monitoring.yml)
+listen:
+  port: 4040
+  address: "0.0.0.0"
+
+namespaces:
+  - name: nginx
+    format: '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time'
+    source:
+      files:
+        - /var/log/nginx/access_timed.log
+    # Histogram buckets (seconds) for the request time -> lets Prometheus compute p50/p95/p99
+    histogram_buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
