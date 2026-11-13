@@ -21,3 +21,6 @@ bin/
 
 # Python bytecode
 __pycache__/
+
+# Windows "downloaded from the internet" marker files (WSL)
+*:Zone.Identifier
